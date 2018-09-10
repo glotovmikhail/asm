@@ -8,31 +8,6 @@ using namespace std;
 template<typename ... Args>
 struct args;
 
-template<>
-struct args<> {
-    static const int INT = 0;
-    static const int SSE = 0;
-};
-
-template<typename Any, typename ... Other>
-struct args<Any, Other ...> {
-    static const int INT = args<Other ...>::INT + 1;
-    static const int SSE = args<Other ...>::SSE;
-};
-
-template<typename ... Other>
-struct args<double, Other ...> {
-    static const int INT = args<Other ...>::INT;
-    static const int SSE = args<Other ...>::SSE + 1;
-};
-
-template<typename ... Other>
-struct args<float, Other ...> {
-    static const int INT = args<Other ...>::INT;
-    static const int SSE = args<Other ...>::SSE + 1;
-};
-
-
 template<typename T>
 struct trampoline;
 
@@ -42,13 +17,12 @@ void swap(trampoline<R(Args...)> &a, trampoline<R(Args...)> &b);
 template<typename T, typename ... Args>
 struct trampoline<T(Args ...)> {
 private:
-    static const int REGISTERS = 6;
     static const int BYTE = 8;
-
-    const char *shifts[REGISTERS] = {
-            "\x48\x89\xfe" /*mov rsi rdi*/, "\x48\x89\xf2" /*mov rdx rsi*/,
-            "\x48\x89\xd1" /*mov rcx rdx*/, "\x49\x89\xc8" /*mov r8 rcx*/,
-            "\x4d\x89\xc1" /*mov r9 r8*/, "\x41\x51" /*push r9*/
+    
+    struct __attribute__((packed)) NotAlignedStorage {
+        char c;
+        void* funcPtr;
+        void* empty;
     };
 
     void add(char *&p, const char *command) {
@@ -56,14 +30,7 @@ private:
             *(p++) = *i;
     }
 
-    void add(char *&p, const char *command, int32_t c) {
-        add(p, command);
-        *(int32_t *) p = c;
-        p += BYTE / 2;
-    }
-
-    void add(char *&p, const char *command, void *c) {
-        add(p, command);
+    void add_p(char *&p, void *c) {
         *(void **) p = c;
         p += BYTE;
     }
@@ -106,9 +73,11 @@ private:
         return ret;
     }
 
+
+
     template<typename Function>
-    static T caller(void *obj, Args ...args) {
-        return (*static_cast<Function *>(obj))(std::forward<Args>(args)...);
+    static T caller(NotAlignedStorage storage, Args... args) {
+        return (*static_cast<Function *>(storage.funcPtr))(std::forward<Args>(args)...);
     }
 
     template<typename Function>
@@ -119,80 +88,37 @@ private:
     void *func;
     void *code;
     void (*deleter)(void *);
+    T (*caller_)(NotAlignedStorage, Args...);
+
 
 public:
     template<typename Function>
-    trampoline(Function f) : func(new Function(std::move(f))), deleter(del<Function>) {
+    trampoline(Function f) : func(new Function(std::move(f))), caller_(caller<Function>), deleter(del<Function>) {
         code = my_malloc();
         char *pointer_to_code = (char *) code;
 
-        if (args<Args ...>::INT >= REGISTERS) {
-            int stack_size = BYTE * (args<Args ...>::INT - 5 + std::max(args<Args ...>::SSE - BYTE, 0));
-            //move r11 [rsp]
-            add(pointer_to_code, "\x4c\x8b\x1c\x24");
-            for (int i = 5; i >= 0; i--)
-                add(pointer_to_code, shifts[i]);
-
-            //mov rax,[rsp]
-            add(pointer_to_code, "\x48\x89\xe0");
-            //add rax [stack_size + 8]
-            add(pointer_to_code, "\x48\x05", stack_size);
-            //add rsp 8
-            add(pointer_to_code, "\x48\x81\xc4", BYTE);
-
-            char *label_1 = pointer_to_code;
-
-            //cmp rax rsp
-            add(pointer_to_code, "\x48\x39\xe0");
-            //je
-            add(pointer_to_code, "\x74");
-
-            char *label_2 = pointer_to_code;
-            pointer_to_code++;
-
-            // add rsp 8
-            add(pointer_to_code, "\x48\x81\xc4\x08");
-            pointer_to_code += 3;
-            // mov rdi [rsp]
-            add(pointer_to_code, "\x48\x8b\x3c\x24");
-            // mov [rsp - 8] rdi
-            add(pointer_to_code, "\x48\x89\x7c\x24\xf8");
-            // jmp
-            add(pointer_to_code, "\xeb");
-
-            *pointer_to_code = label_1 - pointer_to_code - 1;
-            pointer_to_code++;
-            *label_2 = pointer_to_code - label_2 - 1;
-
-            //mov [rsp], r11
-            add(pointer_to_code, "\x4c\x89\x1c\x24");
-            //sub rsp, stack_size
-            add(pointer_to_code, "\x48\x81\xec", stack_size);
-            //mov rdi, imm
-            add(pointer_to_code, "\x48\xbf", func);
-            //mov rax, imm
-            add(pointer_to_code, "\x48\xb8", (void *) &caller<Function>);
-            //call rax
-            add(pointer_to_code, "\xff\xd0");
-            // pop r9
-            add(pointer_to_code, "\x41\x59");
-            // mov r11 [rsp + stack_size]
-            add(pointer_to_code, "\x4c\x8b\x9c\x24", stack_size - BYTE);
-            // mov [rsp] r11
-            add(pointer_to_code, "\x4c\x89\x1c\x24\xc3");
-        } else {
-            for (int i = args<Args ...>::INT - 1; i >= 0; i--)
-                add(pointer_to_code, shifts[i]);
-            //mov rdi imm
-            add(pointer_to_code, "\x48\xbf", func);
-            //mov rax imm
-            add(pointer_to_code, "\x48\xb8", (void *) &caller<Function>);
-            //mov jmp raxi
-            add(pointer_to_code, "\xff\xe0");
-        }
+        // sub rsp,16
+        add (pointer_to_code, "\x48\x83\xEC\x10");
+        //mov r11,byte
+        add (pointer_to_code, "\x49\xBB");
+        //setting obj adress to last command
+        add_p (pointer_to_code, func);
+        //mov [rsp + 1],r11
+        add (pointer_to_code, "\x4C\x89\x5C\x24\x01");
+        //mov r11,byte
+        add (pointer_to_code, "\x49\xBB");
+        //setting caller adress to last command
+        add_p (pointer_to_code, (void *) caller_);
+        //call r11
+        add (pointer_to_code, "\x41\xFF\xD3");
+        //add rsp,16
+        add (pointer_to_code, "\x48\x83\xC4\x10");
+        //ret
+        add (pointer_to_code, "\xC3");
+             
     }
 
-    trampoline(trampoline &&other) : code(other.code), deleter(other.deleter), func(other.func) {
+    trampoline(trampoline &&other) : code(other.code), caller_(other.caller_), deleter(other.deleter), func(other.func) {
         other.func = nullptr;
     }
 
@@ -249,10 +175,9 @@ void test() {
     p(1, 2, 3, 4, 5);
     b = 43;
 
-    int new_i = 999;
     int res = p(2, 3, 4, 5, 6);
     cout << res << "\n";
-    cout << b << " " << new_i << "\n";
+    cout << b << "\n";
 }
 
 
